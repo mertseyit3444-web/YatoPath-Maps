@@ -4,7 +4,9 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
+import osmium
 import requests
 
 from tools.build_world_regions import (MAX_REDIRECTS, MAX_SOURCE_PAGE_BYTES,
@@ -94,12 +96,146 @@ class SourceDownloadTests(unittest.TestCase):
                           Response(DATED))
         self.assertEqual(self.download(session).read_bytes(), BODY)
 
-    def test_official_page_and_dated_source_retry_only_timeouts_with_bounded_attempts(self):
+    def test_official_page_and_dated_source_retry_timeouts_with_bounded_attempts(self):
         session = Session(requests.ReadTimeout(), requests.ReadTimeout(), requests.ReadTimeout(),
                           Response(BASE + ".html", body=b'<a href="nauru-260930.osm.pbf">'),
                           requests.ReadTimeout(), Response(DATED))
         self.assertEqual(self.download(session).read_bytes(), BODY)
         self.assertEqual(session.calls, [LATEST] + [BASE + ".html"] * 3 + [DATED] * 2)
+
+    def test_transient_official_page_and_dated_pbf_share_three_attempt_budget(self):
+        page_url = BASE + ".html"
+        responses = [Response(page_url, status=503), Response(page_url, status=502),
+                     Response(page_url, body=b'<a href="nauru-260930.osm.pbf">'),
+                     Response(DATED, status=429, headers={"Retry-After": "1"}),
+                     Response(DATED, status=504), Response(DATED)]
+        session = Session(requests.ReadTimeout(), *responses)
+        with patch("tools.build_world_regions.time.sleep") as sleep:
+            path = self.download(session)
+        self.assertEqual(path.read_bytes(), BODY)
+        self.assertEqual(path.with_suffix(".pbf.sha256").read_text().strip(), hashlib.sha256(BODY).hexdigest())
+        self.assertEqual(session.calls, [LATEST] + [page_url] * 3 + [DATED] * 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.25, 0.5, 1.0, 0.5])
+        self.assertTrue(all(response.closed for response in responses))
+        self.assertTrue(all(not response.consumed for response in responses if response.status_code != 200))
+
+    def test_official_page_503_then_dated_503_downloads_genuine_pbf(self):
+        fixture = Path(self.folder.name) / "fixture.osm.pbf"
+        with osmium.SimpleWriter(str(fixture)) as writer:
+            writer.add_node(osmium.osm.mutable.Node(id=1, location=(166.93, -0.52)))
+            writer.add_node(osmium.osm.mutable.Node(id=2, location=(166.931, -0.52)))
+            writer.add_way(osmium.osm.mutable.Way(id=10, nodes=[1, 2], tags={"highway": "residential"}))
+        genuine = fixture.read_bytes()
+        page_error, dated_error = Response(BASE + ".html", status=503), Response(DATED, status=503)
+        session = Session(requests.ReadTimeout(), page_error,
+                          Response(BASE + ".html", body=b'<a href="nauru-260930.osm.pbf">'),
+                          dated_error, Response(DATED, body=genuine))
+        with patch("tools.build_world_regions.time.sleep"):
+            path = self.download(session, limit=len(genuine))
+        self.assertEqual(path.read_bytes(), genuine)
+        self.assertEqual(path.with_suffix(".pbf.sha256").read_text().strip(), hashlib.sha256(genuine).hexdigest())
+        class Ways(osmium.SimpleHandler):
+            def __init__(self):
+                super().__init__()
+                self.ids = []
+            def way(self, way):
+                self.ids.append(way.id)
+        reader = Ways()
+        reader.apply_file(str(path))
+        self.assertEqual(reader.ids, [10])
+        self.assertTrue(page_error.closed and dated_error.closed)
+        self.assertFalse(page_error.consumed or dated_error.consumed)
+
+    def test_untrusted_response_url_is_rejected_before_status_retry(self):
+        response = Response("https://evil.invalid/source.osm.pbf", status=503)
+        session = Mock()
+        session.get.return_value = response
+        with patch("tools.build_world_regions.time.sleep") as sleep:
+            with self.assertRaisesRegex(ValueError, "Unexpected Geofabrik response URL"):
+                official_stream(session, DATED, timeout_attempts=3)
+        session.get.assert_called_once()
+        self.assertTrue(response.closed)
+        self.assertFalse(response.consumed)
+        sleep.assert_not_called()
+
+    def test_each_retryable_status_then_success_reuses_exact_dated_url(self):
+        for status in (429, 502, 503, 504):
+            with self.subTest(status=status):
+                first, final = Response(DATED, status=status), Response(DATED)
+                session = Session(first, final)
+                with patch("tools.build_world_regions.time.sleep") as sleep:
+                    response = official_stream(session, DATED, timeout_attempts=3)
+                self.assertIs(response, final)
+                self.assertEqual(session.calls, [DATED, DATED])
+                self.assertTrue(first.closed)
+                self.assertFalse(first.consumed)
+                sleep.assert_called_once_with(0.25)
+                response.close()
+
+    def test_timeout_and_status_retries_do_not_have_separate_budgets(self):
+        responses = [Response(DATED, status=503), Response(DATED, status=504)]
+        session = Session(requests.ReadTimeout(), *responses)
+        with patch("tools.build_world_regions.time.sleep") as sleep:
+            with self.assertRaises(requests.HTTPError) as caught:
+                official_stream(session, DATED, timeout_attempts=3)
+        self.assertIs(caught.exception.response, responses[-1])
+        self.assertEqual(session.calls, [DATED] * 3)
+        self.assertTrue(all(response.closed and not response.consumed for response in responses))
+        sleep.assert_called_once_with(0.5)
+        self.assertFalse(self.cache.exists())
+
+    def test_exhausted_transient_responses_all_close_without_another_revision(self):
+        responses = [Response(DATED, status=503) for _ in range(3)]
+        session = Session(*responses)
+        with patch("tools.build_world_regions.time.sleep") as sleep:
+            with self.assertRaises(requests.HTTPError):
+                official_stream(session, DATED, timeout_attempts=3)
+        self.assertEqual(session.calls, [DATED] * 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertTrue(all(response.closed and not response.consumed for response in responses))
+
+    def test_non_retryable_http_statuses_do_not_spend_remaining_attempts(self):
+        for status in (401, 403, 404, 500):
+            with self.subTest(status=status):
+                response = Response(DATED, status=status)
+                session = Session(response)
+                with patch("tools.build_world_regions.time.sleep") as sleep:
+                    with self.assertRaises(requests.HTTPError):
+                        official_stream(session, DATED, timeout_attempts=3)
+                self.assertEqual(session.calls, [DATED])
+                self.assertTrue(response.closed)
+                self.assertFalse(response.consumed)
+                sleep.assert_not_called()
+
+    def test_retry_after_is_short_bounded_seconds_only(self):
+        for header, expected in (("0", 0.0), ("2", 2.0), ("3", 0.25), ("999999999999", 0.25),
+                                 ("Wed, 21 Oct 2099 07:28:00 GMT", 0.25), ("-1", 0.25),
+                                 ("nan", 0.25), ("1.5", 0.25)):
+            with self.subTest(header=header):
+                first, final = Response(DATED, status=429, headers={"Retry-After": header}), Response(DATED)
+                with patch("tools.build_world_regions.time.sleep") as sleep:
+                    response = official_stream(Session(first, final), DATED, timeout_attempts=3)
+                sleep.assert_called_once_with(expected)
+                self.assertTrue(first.closed)
+                response.close()
+
+    def test_latest_transient_error_keeps_single_attempt_without_fallback(self):
+        response = Response(LATEST, status=503)
+        session = Session(response)
+        with patch("tools.build_world_regions.time.sleep") as sleep:
+            with self.assertRaises(requests.HTTPError):
+                self.download(session)
+        self.assertEqual(session.calls, [LATEST])
+        self.assertTrue(response.closed)
+        sleep.assert_not_called()
+
+    def test_invalid_retry_budgets_never_request_network(self):
+        session = Session()
+        for attempts in (0, -1, 4, True, 1.5):
+            with self.subTest(attempts=attempts):
+                with self.assertRaises(ValueError):
+                    official_stream(session, DATED, timeout_attempts=attempts)
+        self.assertFalse(session.calls)
 
     def test_official_page_timeout_budget_is_finite(self):
         session = Session(requests.ReadTimeout(), *[requests.ReadTimeout() for _ in range(3)])
@@ -119,6 +255,19 @@ class SourceDownloadTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unexpected PBF"):
             self.download(session, DATED)
         self.assertFalse(self.cache.exists())
+
+    def test_invalid_dated_body_after_fallback_is_not_retried(self):
+        html = Response(DATED, headers={"Content-Type": "text/html"})
+        session = Session(requests.ReadTimeout(),
+                          Response(BASE + ".html", body=b'<a href="nauru-260930.osm.pbf">'), html)
+        with patch("tools.build_world_regions.time.sleep") as sleep:
+            with self.assertRaisesRegex(ValueError, "Unexpected PBF"):
+                self.download(session)
+        self.assertEqual(session.calls, [LATEST, BASE + ".html", DATED])
+        self.assertTrue(html.closed)
+        self.assertFalse(html.consumed)
+        self.assertFalse(self.cache.exists())
+        sleep.assert_not_called()
 
     def test_latest_self_loop_uses_newest_advertised_official_dated_extract(self):
         responses = [

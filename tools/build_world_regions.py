@@ -12,6 +12,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -21,6 +22,8 @@ import requests
 INDEX_URL = "https://download.geofabrik.de/index-v1-nogeom.json"
 MAX_REDIRECTS = 5
 MAX_SOURCE_PAGE_BYTES = 1_048_576
+TRANSIENT_HTTP_STATUSES = frozenset((429, 502, 503, 504))
+MAX_SOURCE_RETRY_DELAY = 2.0
 
 
 def official_url(url):
@@ -41,7 +44,9 @@ class SourceRedirectError(ValueError):
 
 
 def official_stream(session, url, timeout_attempts=1):
-    """Validate every hop before requesting it; never automatically follow it."""
+    """Validate every hop; share a bounded timeout/transient-status attempt budget."""
+    if type(timeout_attempts) is not int or not 1 <= timeout_attempts <= 3:
+        raise ValueError("Official source attempts must be 1...3")
     visited = set()
     for _ in range(MAX_REDIRECTS + 1):
         if not official_url(url):
@@ -53,10 +58,30 @@ def official_stream(session, url, timeout_attempts=1):
             try:
                 response = session.get(url, allow_redirects=False, stream=True,
                                        headers={"Accept-Encoding": "identity"}, timeout=(20, 60))
-                break
             except requests.Timeout:
                 if attempt + 1 == timeout_attempts:
                     raise
+                continue
+            if not official_url(response.url):
+                response.close()
+                raise ValueError("Unexpected Geofabrik response URL")
+            if response.status_code in TRANSIENT_HTTP_STATUSES:
+                if attempt + 1 == timeout_attempts:
+                    try:
+                        response.raise_for_status()
+                    finally:
+                        response.close()
+                # Discard the error body before another request. Only a short
+                # integer Retry-After is honored; dates/large/malformed values
+                # cannot create an unbounded wait or alter the source revision.
+                retry_after = response.headers.get("Retry-After", "")
+                delay = min(MAX_SOURCE_RETRY_DELAY, 0.25 * (2 ** attempt))
+                if re.fullmatch(r"[0-9]{1,2}", retry_after) and int(retry_after) <= MAX_SOURCE_RETRY_DELAY:
+                    delay = float(retry_after)
+                response.close()
+                time.sleep(delay)
+                continue
+            break
         if not official_url(response.url):
             response.close()
             raise ValueError("Unexpected Geofabrik response URL")
@@ -135,21 +160,24 @@ def source_file(session, source_id, source_url, cache, max_bytes):
         raise ValueError("--max-source-bytes must be positive")
     if not official_url(source_url) or not source_url.endswith(".osm.pbf"):
         raise ValueError(f"Untrusted PBF URL for {source_id}")
+    used_dated_fallback = False
     try:
         stream = official_stream(session, source_url)
     except (SourceRedirectError, requests.Timeout):
         if not source_url.endswith("-latest.osm.pbf"):
             raise
         stream = official_stream(session, dated_source_url(session, source_url), timeout_attempts=3)
+        used_dated_fallback = True
     except requests.HTTPError as error:
         if (error.response is None or error.response.status_code != 404
                 or not source_url.endswith("-latest.osm.pbf")):
             raise
         stream = official_stream(session, dated_source_url(session, source_url), timeout_attempts=3)
+        used_dated_fallback = True
     # Some latest aliases return a successful HTML directory page after adding
     # a slash. Treat only that trusted alias failure as a dated-source fallback.
     content_type = stream.headers.get("Content-Type", "").lower()
-    if (stream.status_code == 200 and source_url.endswith("-latest.osm.pbf")
+    if (not used_dated_fallback and stream.status_code == 200 and source_url.endswith("-latest.osm.pbf")
             and (not stream.url.endswith(".osm.pbf") or "text/html" in content_type)):
         stream.close()
         stream = official_stream(session, dated_source_url(session, source_url), timeout_attempts=3)
