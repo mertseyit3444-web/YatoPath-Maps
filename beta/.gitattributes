@@ -1,0 +1,3 @@
+# Boundaries and inventory carry exact audited byte hashes on every platform.
+inventory.json -text
+boundaries/*.geojson -text
