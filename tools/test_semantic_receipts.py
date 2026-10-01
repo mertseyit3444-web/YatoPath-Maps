@@ -151,9 +151,11 @@ with patch('tools.world_release.shutil.disk_usage',return_value=SimpleNamespace(
         with self.assertRaises(ValueError):
             build_source(self.args)
         receipt = json.loads((self.folder / "semantic-receipt.json").read_text())
-        releases = [[{"tag_name": release_tag(self.args.source, self.args.edition), "assets": [
-            {"name": "receipt.json", "browser_download_url": "https://example.invalid/receipt.json"},
-            {"name": "catalog.json", "browser_download_url": "https://example.invalid/catalog.json"}]}]]
+        tag = release_tag(self.args.source, self.args.edition)
+        base = "https://github.com/fixture/YatoPath-Maps/releases/download/" + tag + "/"
+        releases = [[{"tag_name": tag, "assets": [
+            {"name": "receipt.json", "browser_download_url": base + "receipt.json"},
+            {"name": "catalog.json", "browser_download_url": base + "catalog.json"}]}]]
         session = Mock()
         session.__enter__ = Mock(return_value=session)
         session.__exit__ = Mock(return_value=False)

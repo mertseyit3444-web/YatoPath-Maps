@@ -352,6 +352,7 @@ def matrix(args):
 
 def collect(args):
     document = checked_inventory(args.inventory)
+    fingerprint = inventory_fingerprint(args.inventory)
     pages = run_gh("api", "--paginate", "--slurp", "repos/" + REPOSITORY + "/releases", json_result=True)
     releases = [release for page in pages for release in page]
     by_tag = {release["tag_name"]: release for release in releases}
@@ -363,23 +364,47 @@ def collect(args):
         if "receipt.json" not in assets or "catalog.json" not in assets:
             missing.append(source)
             continue
+        base_url = "https://github.com/" + REPOSITORY + "/releases/download/" + tag + "/"
+        for name in ("receipt.json", "catalog.json"):
+            if assets[name].get("browser_download_url") != base_url + name:
+                raise ValueError("Regional metadata belongs to another repository or release")
         with requests.Session() as session:
             receipt_response = session.get(assets["receipt.json"]["browser_download_url"], timeout=30)
             receipt_response.raise_for_status()
             receipt = receipt_response.json()
-            if receipt.get("verified") is not True or receipt.get("inventorySHA256") != inventory_fingerprint(args.inventory):
+            if (not isinstance(receipt, dict) or receipt.get("verified") is not True
+                    or type(receipt.get("schemaVersion")) is not int or receipt["schemaVersion"] != 1
+                    or receipt.get("inventorySHA256") != fingerprint
+                    or receipt.get("sourceId") != source or receipt.get("tag") != tag
+                    or not re.fullmatch(r"[a-f0-9]{64}", str(receipt.get("sourceSHA256", "")))
+                    or receipt.get("publishable") is False or receipt.get("status") == "pending-review"):
                 raise ValueError("Unverified or mismatched regional release")
             catalog_response = session.get(assets["catalog.json"]["browser_download_url"], timeout=30)
             catalog_response.raise_for_status()
             catalog = catalog_response.json()
             if hashlib.sha256(catalog_response.content).hexdigest() != receipt.get("catalogSHA256"):
                 raise ValueError("Regional catalog changed after its live verification")
-        catalog_assets(catalog)
+        regional_assets = catalog_assets(catalog)
+        if type(receipt.get("packCount")) is not int or receipt["packCount"] != len(catalog["packs"]):
+            raise ValueError("Regional pack count differs from its verified receipt")
+        for asset in regional_assets:
+            if (not asset["url"].startswith(base_url)
+                    or not re.fullmatch(r"[A-Za-z0-9._-]+", asset["url"][len(base_url):])):
+                raise ValueError("Regional map asset belongs to another repository or release")
         for pack in catalog["packs"]:
             if pack["id"] in packs:
                 raise ValueError("Duplicate downloadable region ID")
             packs[pack["id"]] = pack
-        receipts.append(receipt)
+        # Retain identities and exact metadata hashes, not full downloads or
+        # credentials. These attest to the already-live regional verification;
+        # collection itself does not repeat each large asset download.
+        receipts.append({"sourceId": source, "tag": tag,
+                         "receiptURL": base_url + "receipt.json",
+                         "receiptSHA256": hashlib.sha256(receipt_response.content).hexdigest(),
+                         "catalogURL": base_url + "catalog.json",
+                         "catalogSHA256": receipt["catalogSHA256"],
+                         "sourceSHA256": receipt["sourceSHA256"],
+                         "packCount": receipt["packCount"]})
     # Always retain the currently published Monaco pack, including its exact ID
     # and hashes; the new catalogue must not implicitly replace installed data.
     current_url = "https://github.com/" + REPOSITORY + "/releases/latest/download/catalog.json"
@@ -390,21 +415,27 @@ def collect(args):
             packs[pack["id"]] = pack
         else:
             packs.setdefault(pack["id"], pack)
-    report = {"sourceCount": len(source_groups(document)), "verifiedSourceCount": len(receipts),
-              "missingSources": missing, "packCount": len(packs), "complete": not missing}
-    write_json(args.work / "world-status.json", report)
-    catalog = {"schemaVersion": 1, "generatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    generated_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    catalog = {"schemaVersion": 1, "generatedAt": generated_at,
                "packs": sorted(packs.values(), key=lambda pack: pack["id"])}
     catalog_file = args.work / "catalog.json"
     write_json(catalog_file, catalog)
     catalog_assets(catalog)
     if catalog_file.stat().st_size > 5_000_000 or len(packs) > 10000:
         raise ValueError("Catalog exceeds the verified mobile limits")
+    evidence_file = args.work / "verified-receipts.json"
+    write_json(evidence_file, {"schemaVersion": 1, "repository": REPOSITORY,
+                              "edition": args.edition, "generatedAt": generated_at,
+                              "inventorySHA256": fingerprint, "receipts": receipts})
+    report = {"sourceCount": len(source_groups(document)), "verifiedSourceCount": len(receipts),
+              "missingSources": missing, "packCount": len(packs), "complete": not missing,
+              "verifiedReceiptIndexSHA256": sha256(evidence_file)}
+    write_json(args.work / "world-status.json", report)
     if args.publish:
         tag = args.edition + "-catalog-" + str(args.catalog_revision)
         run_gh("release", "create", tag, "--repo", REPOSITORY, "--prerelease", "--latest=false",
                "--title", "YatoPath offline map catalog", "--notes", "Verified regional map downloads; coverage status is in world-status.json.",
-               str(catalog_file), str(args.work / "world-status.json"))
+               str(catalog_file), str(args.work / "world-status.json"), str(evidence_file))
         live = requests.get("https://github.com/" + REPOSITORY + "/releases/download/" + tag + "/catalog.json", timeout=30)
         live.raise_for_status()
         if live.content != catalog_file.read_bytes():

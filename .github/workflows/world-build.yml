@@ -55,7 +55,7 @@ jobs:
           curl --fail --location https://github.com/protomaps/go-pmtiles/releases/download/v1.31.2/go-pmtiles_1.31.2_Linux_x86_64.tar.gz --output pmtiles.tar.gz
           echo '3ed7dbf4ec2e6dfe5e25b6f70d1ffc932729f93c86db353bf514dd71010a312f  pmtiles.tar.gz' | sha256sum --check
           tar -xzf pmtiles.tar.gz pmtiles
-          python -m unittest tools.test_region_pipeline tools.test_world_inventory tools.test_world_release tools.test_source_download tools.test_repository_destination tools.test_semantic_receipts -v
+          python -m unittest tools.test_region_pipeline tools.test_world_inventory tools.test_world_release tools.test_source_download tools.test_repository_destination tools.test_semantic_receipts tools.test_world_receipt_collection -v
       - name: Produce and verify one source
         env:
           GH_TOKEN: ${{ github.token }}
