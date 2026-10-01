@@ -6,9 +6,11 @@ No app source, user database or account credential is part of the release.
 import argparse
 import datetime as dt
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
+import platform
 import re
 import shutil
 import sqlite3
@@ -23,11 +25,11 @@ import requests
 from shapely.geometry import box, mapping
 
 try:
-    from tools.build_region_pack import build, load_boundary
+    from tools.build_region_pack import NoRunnableRoads, build, load_boundary
     from tools.build_world_regions import source_file
     from tools.verify_map_host import catalog_assets, verify
 except ModuleNotFoundError:
-    from build_region_pack import build, load_boundary
+    from build_region_pack import NoRunnableRoads, build, load_boundary
     from build_world_regions import source_file
     from verify_map_host import catalog_assets, verify
 
@@ -44,6 +46,15 @@ def destination_repository(explicit=None):
     if not value or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/YatoPath-Maps", value):
         raise ValueError("Configure an explicit OWNER/YatoPath-Maps destination repository")
     return value
+
+
+def require_public_repository(repository):
+    repository = destination_repository(repository)
+    result = subprocess.run(["gh", "repo", "view", repository, "--json", "nameWithOwner,visibility"],
+                            check=True, capture_output=True, text=True, encoding="utf-8")
+    state = json.loads(result.stdout)
+    if state.get("nameWithOwner") != repository or state.get("visibility") != "PUBLIC":
+        raise ValueError("Publishing requires the exact configured PUBLIC map repository")
 
 
 def sha256(path):
@@ -152,10 +163,8 @@ def pack_region(source, region_id, name, boundary, folder, binary, asset_limit, 
             try:
                 child = pack_region(road, region_id, name, part, folder, binary, asset_limit,
                                     maxzoom, source_state=candidate_id, suffix=suffix + str(index), depth=depth+1)
-            except SystemExit as error:
-                if str(error).startswith("No runnable roads found"):
-                    continue
-                raise
+            except NoRunnableRoads:
+                continue
             result.extend(child)
         if not result:
             raise ValueError("Splitting discarded all roads")
@@ -174,6 +183,16 @@ def pack_region(source, region_id, name, boundary, folder, binary, asset_limit, 
 
 
 def run_gh(*arguments, json_result=False):
+    if arguments[:2] in (("release", "create"), ("release", "upload"), ("release", "edit")):
+        repository = destination_repository(REPOSITORY)
+        if arguments.count("--repo") != 1:
+            raise ValueError("Release writes require an explicit configured map repository")
+        index = arguments.index("--repo")
+        if index + 1 >= len(arguments) or arguments[index + 1] != repository:
+            raise ValueError("Release write destination differs from configured map repository")
+        # Recheck visibility immediately before each mutation; an API/auth error
+        # or a repository made private must not fall through to a release write.
+        require_public_repository(repository)
     result = subprocess.run(["gh", *arguments], check=True, capture_output=True, text=True, encoding="utf-8")
     return json.loads(result.stdout) if json_result else result.stdout
 
@@ -182,6 +201,24 @@ def release_tag(source_id, edition):
     if not re.fullmatch(r"[a-z0-9-]{1,30}", edition):
         raise ValueError("Edition must be an ASCII release slug")
     return edition + "-" + source_key(source_id)
+
+
+def production_context(args):
+    """Public tool/input identities, without local paths, credentials or guesses."""
+    versions = {}
+    for name in ("osmium", "shapely", "requests"):
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    return {"inventorySHA256": inventory_fingerprint(args.inventory),
+            "inventoryByteSHA256": sha256(args.inventory),
+            "toolSHA256": {name: sha256(ROOT / name) for name in
+                           ("world_release.py", "build_world_regions.py", "build_region_pack.py")},
+            "pythonVersion": platform.python_version(), "packageVersions": versions,
+            "configuration": {"maxSourceBytes": args.max_source_bytes,
+                              "assetLimit": args.asset_limit, "maxzoom": args.maxzoom,
+                              "stableClips": True}}
 
 
 def build_source(args):
@@ -205,27 +242,54 @@ def build_source(args):
     urls = {region["pbfURL"] for region in regions}
     if len(urls) != 1:
         raise ValueError("Dateline parts must use one source snapshot")
+    requested_url = urls.pop()
+    provenance = {}
     if args.source_pbf:
         source = args.source_pbf
+        # Local pinning must not bypass the same bounded source intake budget.
+        if args.max_source_bytes <= 0 or not 0 < source.stat().st_size <= args.max_source_bytes:
+            raise ValueError("Pinned source PBF exceeds byte limit or is empty")
         if not args.source_sha256 or sha256(source) != args.source_sha256:
             raise ValueError("A pinned source PBF must match its explicit SHA-256")
+        provenance = {"origin": "local-pinned", "requestedURL": requested_url,
+                      "resolvedURL": None, "revision": None, "etag": None,
+                      "lastModified": None, "cacheReused": False,
+                      "sha256": args.source_sha256, "bytes": source.stat().st_size}
     else:
         with requests.Session() as session:
-            source = source_file(session, args.source, urls.pop(), args.work / "source-cache", args.max_source_bytes)
+            source = source_file(session, args.source, requested_url, args.work / "source-cache",
+                                 args.max_source_bytes, provenance=provenance)
+    provenance = {"schemaVersion": 1, "sourceId": args.source,
+                  "observedAt": dt.datetime.now(dt.timezone.utc).isoformat(), **provenance}
+    # Preserve exact source evidence before extraction/storage checks can fail.
+    # resolvedURL/revision remain null for local pinning; the inventory URL does
+    # not prove that this particular local PBF came from that endpoint.
+    write_json(folder / "source-provenance.json", provenance)
+    context = production_context(args)
     if shutil.disk_usage(args.work).free < max(source.stat().st_size * 3, 3_000_000_000):
         raise ValueError("Insufficient free space for road extraction; source is retained for retry")
-    selected = []
+    selected, zero_observations = [], []
     for region in regions:
         id = KNOWN_IDS.get(args.source, region["id"]) if len(regions) == 1 else region["id"]
         boundary = load_boundary(args.inventory.parent / "boundaries" / region["boundary"])
         try:
             selected.extend(pack_region(source, id, region["name"], boundary, folder / "build",
                                         args.pmtiles_bin.resolve(), args.asset_limit, args.maxzoom))
-        except SystemExit as error:
-            if str(error).startswith("No runnable roads found"):
-                continue
-            raise
+        except NoRunnableRoads as error:
+            zero_observations.append({"auditedRegionId": region["id"],
+                                      "boundarySHA256": region["boundarySHA256"],
+                                      "inputBoundarySHA256": region.get("inputBoundarySHA256"),
+                                      **error.evidence})
     if not selected:
+        # This diagnostic is never receipt.json, a release or a coverage waiver.
+        # Partial parsing/other exceptions cannot reach this completed-zero path.
+        if len(zero_observations) == len(regions):
+            write_json(folder / "semantic-receipt.json",
+                       {"schemaVersion": 1, "sourceId": args.source,
+                        "outcome": "no-runnable-roads", "status": "pending-review",
+                        "verified": False, "publishable": False, "packCount": 0,
+                        "source": provenance, "context": context,
+                        "observations": zero_observations})
         raise ValueError("No runnable roads in this source; disposition requires review")
     if len(selected) * 2 + 3 > 1000:
         raise ValueError("Too many assets for one GitHub release")
@@ -381,7 +445,9 @@ def main():
     if args.action != "matrix":
         try:
             REPOSITORY = destination_repository(args.repository)
-        except ValueError as error:
+            if args.publish:
+                require_public_repository(REPOSITORY)
+        except (ValueError, subprocess.CalledProcessError) as error:
             parser.error(str(error))
     args.work.mkdir(parents=True, exist_ok=True)
     {"matrix": matrix, "build": build_source, "collect": collect}[args.action](args)

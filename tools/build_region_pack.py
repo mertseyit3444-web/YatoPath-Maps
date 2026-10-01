@@ -26,6 +26,18 @@ FOOT_ALLOWED = {"yes", "designated", "official", "permissive"}
 FORBIDDEN = {"no", "private"}
 
 
+class NoRunnableRoads(SystemExit):
+    """Completed input processing and SQL count=0; never a parse/network error."""
+
+    def __init__(self, region_id, boundary, input_kind, source_state):
+        super().__init__("No runnable roads found; check source region and input")
+        self.evidence = {"regionId": region_id, "inputKind": input_kind,
+                         "inputFullyRead": True, "roadCount": 0, "roadMeters": 0,
+                         "sourceState": source_state,
+                         "clippingBoundarySHA256": (hashlib.sha256(boundary.read_bytes()).hexdigest()
+                                                    if boundary else None)}
+
+
 def meters(a, b, c, d):
     r1, r2 = math.radians(a), math.radians(c)
     h = math.sin((r2-r1)/2)**2 + math.cos(r1)*math.cos(r2)*math.sin(math.radians(d-b)/2)**2
@@ -222,7 +234,8 @@ def build(args):
             from_database(db, args.from_db, args.source_state, args.region_id, boundary, getattr(args, "stable_clips", False))
         count, total = db.execute("SELECT count(*), coalesce(sum(length),0) FROM segments").fetchone()
         if count == 0:
-            raise SystemExit("No runnable roads found; check source region and input")
+            raise NoRunnableRoads(args.region_id, args.boundary,
+                                  "pbf" if args.pbf else "roads-db", args.source_state)
         bounds = db.execute("SELECT min(min_lat),min(min_lon),max(max_lat),max(max_lon) FROM segment_bounds").fetchone()
         db.execute("INSERT INTO region_totals VALUES (?,?)", (args.region_id, total))
         id_scheme = "osm-node-pair-v1" if args.pbf else (

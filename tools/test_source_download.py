@@ -74,6 +74,50 @@ class SourceDownloadTests(unittest.TestCase):
     def download(self, session, url=LATEST, limit=1024):
         return source_file(session, "country/source", url, self.cache, limit)
 
+    def test_complete_redirected_source_records_exact_provenance_without_changing_path_api(self):
+        proof = {}
+        response = Response(DATED, headers={"Content-Length": str(len(BODY)), "ETag": '"revision"'})
+        path = source_file(Session(Response(LATEST, status=302, headers={"Location": DATED}), response),
+                           "country/source", LATEST, self.cache, 1024, provenance=proof)
+        self.assertIsInstance(path, Path)
+        self.assertEqual(proof["requestedURL"], LATEST)
+        self.assertEqual(proof["resolvedURL"], DATED)
+        self.assertEqual(proof["revision"], "nauru-260930.osm.pbf")
+        self.assertEqual(proof["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual(proof["bytes"], len(BODY))
+        self.assertEqual(proof["etag"], '"revision"')
+        self.assertFalse(proof["cacheReused"])
+        self.assertTrue(response.closed)
+
+    def test_checksum_verified_cache_reports_reuse_and_observed_source_url(self):
+        source_file(Session(Response(DATED)), "country/source", DATED, self.cache, 1024)
+        proof, response = {}, Response(DATED)
+        path = source_file(Session(response), "country/source", DATED, self.cache, 1024, provenance=proof)
+        self.assertTrue(proof["cacheReused"])
+        self.assertFalse(response.consumed)
+        self.assertEqual(proof["resolvedURL"], DATED)
+        self.assertEqual(proof["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual(proof["bytes"], path.stat().st_size)
+
+    def test_direct_latest_validator_cache_key_is_not_fabricated_dated_revision(self):
+        proof = {}
+        path = source_file(Session(Response(LATEST, headers={"ETag": '"version-one"',
+                           "Content-Length": str(len(BODY))})), "country/source", LATEST,
+                           self.cache, 1024, provenance=proof)
+        self.assertIsNone(proof["revision"])
+        self.assertEqual(proof["resolvedURL"], LATEST)
+        self.assertEqual(proof["etag"], '"version-one"')
+        self.assertNotIn("latest", path.name)
+
+    def test_truncated_source_never_emits_successful_acquisition_provenance(self):
+        proof = {}
+        response = Response(DATED, headers={"Content-Length": str(len(BODY) + 1)})
+        with self.assertRaisesRegex(ValueError, "Truncated PBF"):
+            source_file(Session(response), "country/source", DATED, self.cache, 1024, provenance=proof)
+        self.assertEqual(proof, {})
+        self.assertTrue(response.closed)
+        self.assertEqual(list(self.cache.glob("*.part")), [])
+
     def test_stalled_latest_uses_official_advertised_dated_source(self):
         session = Session(requests.ReadTimeout("stalled latest alias"),
                           Response(BASE + ".html", body=b'<a href="nauru-260930.osm.pbf">extract</a>'),
