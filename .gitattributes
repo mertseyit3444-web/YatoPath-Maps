@@ -1,0 +1,2 @@
+*.geojson -text
+world/inventory.json -text
