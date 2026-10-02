@@ -1,6 +1,7 @@
 # YatoPath first beta map coverage
 
-Prepared 1 October 2026. This is a **three-region beta**, with Istanbul
+Prepared 1 October 2026; map publication checked 2 October 2026 UTC.
+This is a **three-region beta**, with Istanbul
 province, Washington DC and Maryland. It is not a complete world map release.
 The checked beta inventory is [`beta/inventory.json`](beta/inventory.json);
 its canonical SHA-256 is
@@ -54,29 +55,74 @@ Download metadata dates and boundary response dates are not substituted for
 PBF byte hashes. Public PBFs omit contributor personal metadata; internal
 Geofabrik history/metadata files are not used.
 
-## Intended immutable release URLs — publication gate still open
+## Published map releases — limited beta publication gate passed
 
-Edition: `beta-20261001`. These are intended per-source immutable receipt and
-catalog locations, not a claim that the assets have passed live HTTPS checks:
+Edition: `beta-20261001`. All three selected source releases have verified
+receipts and completed live HTTPS byte-count, SHA-256 and HTTP 206 range checks.
+The combined catalog contains **8 packs**: Istanbul (1), Washington DC (1),
+Maryland (5), and the unchanged Monaco pilot (1). This completes publication
+for the selected beta scope; it does not establish full-world or phone acceptance.
 
-| Source | Release tag | Intended catalog |
+| Source | Release tag | Published catalog |
 |---|---|---|
 | Istanbul | `beta-20261001-9752309ecc0e1c5109eb` | [catalog](https://github.com/mertseyit3444-web/YatoPath-Maps/releases/download/beta-20261001-9752309ecc0e1c5109eb/catalog.json) |
 | DC | `beta-20261001-076b07119b3a14046c1d` | [catalog](https://github.com/mertseyit3444-web/YatoPath-Maps/releases/download/beta-20261001-076b07119b3a14046c1d/catalog.json) |
 | Maryland | `beta-20261001-7f7efbdcb8280c594e55` | [catalog](https://github.com/mertseyit3444-web/YatoPath-Maps/releases/download/beta-20261001-7f7efbdcb8280c594e55/catalog.json) |
 
-Each tag also requires `receipt.json` at the same immutable download prefix.
-Release collection accepts a source only after its verified receipt binds the
-exact source ID, release tag, common beta inventory fingerprint, PBF hash and
-catalog hash. Every advertised road/vector asset must pass live HTTPS byte
-count, SHA-256 and range checks. A local build or a prepared boundary is not
-that evidence. The publisher updates this status only after actual verification;
-no incomplete beta is represented as complete world coverage.
+Each tag has `receipt.json` at the same immutable download prefix. The verified
+receipts bind exact source IDs, release tags, the common beta inventory
+fingerprint, PBF hashes and regional catalog hashes. Maryland's five road and
+five vector assets passed those live checks; its regional catalog SHA-256 is
+`96cc7753742818f232e461f209deb48c11652ee7eaaf89b6494ed755f2419e38`.
 
-The verified Monaco pilot must retain its existing pack identity and hashes
-when the beta catalog is collected. Installed data and legacy progress are not
-rewritten merely because a new catalog or source ID exists. Real iPhone
-download/offline/reopen/GPS/data-upgrade checks remain a separate beta gate.
+The immutable combined release is
+[`beta-20261001-catalog-1`](https://github.com/mertseyit3444-web/YatoPath-Maps/releases/tag/beta-20261001-catalog-1).
+Its [catalog](https://github.com/mertseyit3444-web/YatoPath-Maps/releases/download/beta-20261001-catalog-1/catalog.json)
+SHA-256 is
+`23268eb56f43cfb355153d312d36a70b266717476d7f537a8c2780c485f53137`.
+Its [verified receipt index](https://github.com/mertseyit3444-web/YatoPath-Maps/releases/download/beta-20261001-catalog-1/verified-receipts.json)
+SHA-256 is
+`80e718d8235ca557e7a40560e59b311b5128e6c17a8c78e8a628083f67c805b6`.
+The [current app catalog](https://github.com/mertseyit3444-web/YatoPath-Maps/releases/latest/download/catalog.json)
+was checked against those exact combined-catalog bytes.
+
+Monaco's `mc-monaco` identity and existing asset hashes are preserved.
+Real iPhone download, offline reopen, GPS and existing-data upgrade checks
+remain pending. Simulator checks and published map files do not complete
+that device gate or establish TestFlight/App Store acceptance.
+
+## Maryland's five download parts
+
+The current catalog gives all five parts the same display name,
+`Maryland · Geofabrik full extract`. Each part covers only its own partition.
+Search by the **exact part ID** below to select one unambiguously. City names
+are verified search aliases from the finalized road metadata; they are useful
+search guides, not a claim that an entire city's administrative area lies in
+one part.
+
+| Exact part ID to search | City aliases |
+|---|---|
+| `us-maryland-p0` | Cumberland, Frederick, Hagerstown, Germantown |
+| `us-maryland-p10` | Waldorf, Salisbury, Ocean City, Cambridge |
+| `us-maryland-p1100` | Bethesda, Silver Spring, Annapolis, Rockville |
+| `us-maryland-p1101` | Baltimore, Towson, Westminster, Ellicott City |
+| `us-maryland-p111` | Aberdeen, Elkton, Chestertown, Bel Air |
+
+Download all five parts for the complete Maryland provider footprint; their
+combined road/vector download is 1,067,453,238 bytes (about 1.067 GB).
+Android currently opens one selected part. Select the relevant downloaded
+part when changing areas; downloading every part does not provide automatic
+part switching. List position or a rounded download size is not a reliable
+way to identify a part.
+
+Final partition checks found no area overlap or omitted child footprint.
+The raw provider/leaf symmetric difference was
+`3.1675068113117683e-15` square degrees, a floating-point geometry difference;
+Hausdorff distance was zero, and coverage passed at a `1e-10` degree tolerance.
+The existing minimum-length clipping rule filtered 45 pieces shorter than
+0.5 metres, totalling about 8.61 metres across split boundaries. Retained
+split pieces matched their actual child records. This is not a claim of
+complete OSM data or an independent Maryland administrative-boundary audit.
 
 ## Licensing and repository boundary
 
@@ -90,8 +136,6 @@ basemap/style/font licenses and attribution must remain with delivered assets.
 Map bytes are generated from these sources, not bulk-downloaded from OSM's
 public tile server.
 
-Only public map tools/tests, audited public boundary inventory and this
-coverage documentation belong here. Private app/backend source, user GPS or
-coverage databases, account/signing credentials and unpublished operator/legal
-documents are excluded. This repository does not establish App Store,
-TestFlight, Watch, cloud-account or full-world acceptance.
+This repository hosts public map tools/tests, the audited public boundary
+inventory and map coverage documentation. It does not establish App Store,
+TestFlight, Watch, cloud-account, real-phone or full-world acceptance.
